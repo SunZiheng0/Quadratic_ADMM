@@ -1,0 +1,282 @@
+import copy
+import math
+import sys
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from numpy import trace
+from numpy.linalg import norm
+from scipy import linalg
+
+from Kmeans import Kmeans_test, Kmeans_test_for_PCA
+
+from utils.print_logger import PrintLogger
+
+from sklearn.cluster import KMeans
+from utils.result_analysis import result_analysis
+from utils.PCA_analysis import PCA_analysis_with_k_directions, analysis_k_directions_in_PCA
+
+print_log_file_path = "./log.txt"
+
+
+rho = 1.001
+
+# penalty coefficient mu
+def RowSparse_PCA_ADMM_MSDC(A, h, r, p, name, n_S, S_list_init, X, Y):
+    n_W = n_S
+
+    # initialization
+    mu = 0.5
+    # set V (no meaning)
+    V = np.zeros((p, r))
+
+    # set S
+    S_list = S_list_init
+
+    # set W
+    W_list = []
+    for i in range(n_W):
+        W_list.append(np.zeros((p, r)))
+
+    #Lagrange multiplier
+    Omega_list = []
+    for i in range(n_S):
+        Omega_list.append(np.zeros((p, r)))
+
+    # set Gamma
+    Gamma_list = []
+    for i in range(n_W):
+        Gamma_list.append(np.zeros((p, r)))
+
+    # medium variable
+    J_list = []
+    for i in range(n_S):
+        J_list.append(999)
+
+    # run time
+    max_iteration = 30000
+    t = t0 = 3000
+
+    history_choose_state = []
+    history_choose_obj = []
+    history_min_state = []
+    histroy_min_obj = []
+
+    obj_change_list = []
+    acc_change_list = []
+
+    J_min = 999
+    l_state_min = []
+    iter_min = 0
+
+    theta = 0.5
+    W_state_min = np.zeros((p, r))
+
+    for iteration in range(max_iteration):
+        print("----------------iteration %d begin (h=%d, r=%d, n_S=%d)----------------"%(iteration, h, r, n_S))
+
+        # solve for W, norm_0
+        l_state_list = []
+        for i in range(n_W):
+            B = S_list[i] + 1 / mu * Gamma_list[i]
+            W = np.zeros((p,r))
+            nonzero_idxs, nonzero_rows = calculate_nonzero_rows(B, h)
+            nonzero_idxs = np.sort(nonzero_idxs)
+            l_state_list.append(nonzero_idxs)
+            for j in range(h):
+                W[nonzero_idxs[j]] = nonzero_rows[j]
+            W_list[i] = copy.deepcopy(W)
+            J_list[i] = get_PCA_object_value(A, r, nonzero_idxs)
+            # print("for W %d, the nonzero (selected) index is "%(i) ,nonzero_idxs)
+            # print("the object value of this index subset is %.6f"%(J_list[i]))
+
+        # # select the best l_state:
+        # print("standard PCA J_list: ", J_list)
+        q = np.argmin(J_list)
+        # print("The index of minimal standard = %d" % (q))
+        history_choose_obj.append(J_list[q])
+        history_choose_state.append(l_state_list[q])
+        # print()
+
+        if J_list[q] < J_min:
+            J_min = J_list[q]
+            l_state_min = l_state_list[q]
+            W_state_min = W_list[q]
+            iter_min = iteration
+            t = t0
+
+            sys_out = sys.stdout
+            sys.stdout = PrintLogger(print_log_file_path)
+            PCA_acc = Kmeans_test_for_PCA(idx=l_state_min, r=r, X=X, Y=Y, test_time=5)
+            print("min obj = %.6f, PCA_acc = %.6f" % (J_min, PCA_acc))
+            obj_change_list.append(J_min)
+            acc_change_list.append(PCA_acc)
+            sys.stdout = sys_out
+
+        else:
+            t = t - 1
+            if t == 0:
+                print("t = 0, early stop and return.")
+                print("in %d step, (h=%d, r=%d, n_S=%d),J_min = %.6f, l_min = "%(iter_min, h, r, n_S, J_min), l_state_min)
+                print()
+                plot_obj_history(history_choose_obj, histroy_min_obj, name, n_S, h)
+                return J_min, l_state_min
+            pass
+
+        histroy_min_obj.append(J_min)
+        history_min_state.append(l_state_min)
+
+
+        #solve for V
+        C = S_list[q] - 1 / mu * Omega_list[q]
+        D = A.dot(S_list[q]) + mu / n_S * C
+
+        P0, s0, Qh0 = linalg.svd(D)
+        eigenvector_idx = np.argsort(-1 * s0)[:r]
+        P0 = P0[:, eigenvector_idx]
+        V = P0.dot(Qh0)
+
+        # solve for S
+        for i in range(n_S):
+            # E = V + 1 / mu * Omega_list[i]
+            # F = W_list[i] - 1 / mu * Gamma_list[i]
+            # G = A.dot(V) + mu / n_S * E + mu / n_S * F
+            # beta = math.sqrt(r) / norm(G)
+            #
+            # S_list[i] = beta * G
+
+            E = V + 1 / mu * Omega_list[i]
+            F = W_list[i] - 1 / mu * Gamma_list[i]
+            if iteration > 200:
+                G = A.dot(V) + mu / n_S * E + mu / n_W * F + mu / n_S * theta * W_state_min
+            else:
+                G = A.dot(V) + mu / n_S * E + mu / n_W * F
+
+            P_i, s_i, Qh_i = linalg.svd(G)
+            eigenvector_idx = np.argsort(-1 * s_i)[:r]
+            P_i = P_i[:, eigenvector_idx]
+            S_list[i] = P_i.dot(Qh_i)
+
+
+
+        # Updata model parameters
+        for i in range(n_S):
+            Omega_list[i] += mu * (V - S_list[i])
+
+        for i in range(n_W):
+            Gamma_list[i] += mu * (S_list[i] - W_list[i])
+
+        if iteration >= 1e4:
+            mu = min([mu + 0.1, 10e3])
+
+        if matrix_convergence(iteration, V, S_list, W_list,n_S,n_W, matrix_diff_tol=1e-2) or \
+                state_history_not_change(history_choose_state, length=10) or iteration == max_iteration - 1:
+
+            print("convergence, stop and return.")
+            print("in %d step, (h=%d, r=%d, n_S=%d),J_min = %.6f, l_min = " % (iter_min, h, r, n_S, J_min), l_state_min)
+            plot_obj_history(history_choose_obj, histroy_min_obj, name, n_S, h)
+            return J_min, l_state_min
+
+
+def plot_obj_history(history_choose_obj, histroy_min_obj,name, n_S, h):
+    fig, ax = plt.subplots()
+    ax.plot(history_choose_obj, "b", label="object value in each step")
+    ax.plot(histroy_min_obj, "g", label="min object value ever")
+    ax.set(xlabel='iterations', ylabel="object value",
+           title='(Data: %s) object value changes in each iterations'%(name))
+    ax.grid()
+    ax.legend()
+    fig.savefig("./report_graph/history_obj_n_S_%d(h = %d)_1.png" % (n_S, h))
+
+
+def plot_obj_acc_graph(obj_change_list, acc_change_list,name, n_S, h):
+    fig, ax = plt.subplots()
+    ax.plot(obj_change_list, acc_change_list)
+    ax.set(xlabel='object', ylabel="PCA_acc",
+           title='(Data: %s) acc change on different obj'%(name))
+    ax.grid()
+    ax.legend()
+    fig.savefig("./report_graph/acc_on_diff_obj_n_S_%d(h = %d)_1.png" % (n_S, h))
+
+
+def calculate_nonzero_rows(E, h):
+    norm_list = []
+    p = E.shape[0]
+    for i in range(p):
+        e = E[i]
+        norm_list.append(norm(e))
+
+    norm_list = np.array(norm_list)
+    nonzero_idxs = select_max_n_index(norm_list, h)
+    nonzero_rows = E[nonzero_idxs]
+
+    return nonzero_idxs, nonzero_rows
+
+
+def select_max_n_index(v_list, h):
+    idx = np.argsort(-1 * v_list)[:h]
+    return idx
+
+def matrix_convergence(iteration, V, S_list, W_list,n_S,n_W, matrix_diff_tol=1e-2):
+
+    matrix_V_S_convergence_list = []
+    for i in range(n_S):
+        matrix_V_S_convergence_list.append(False)
+    matrix_V_W_convergence_list = []
+    for i in range(n_W):
+        matrix_V_W_convergence_list.append(False)
+
+    for i in range(n_S):
+        if norm(V - S_list[i]) < matrix_diff_tol:
+            matrix_V_S_convergence_list[i] = True
+
+    for i in range(n_W):
+        if norm(V - W_list[i]) < matrix_diff_tol:
+            matrix_V_W_convergence_list[i] = True
+
+    result = True
+    for i in range(n_S):
+        result = result and matrix_V_S_convergence_list[i]
+    for i in range(n_W):
+        result = result and  matrix_V_W_convergence_list[i]
+
+    return result
+
+def state_history_not_change(history_choose_state, length = 5):
+    if len(history_choose_state) <= length:
+        return False
+
+    idx1 = history_choose_state[-1]
+    for i in range(length-1):
+        idx2 = history_choose_state[-(2 + i)]
+        if idxs_are_the_same(idx1, idx2):
+            continue
+        else:
+            return False
+    return True
+
+
+def idxs_are_the_same(idx1, idx2):
+    for i in range(len(idx1)):
+        if idx1[i] != idx2[i]: return False
+    return True
+
+def get_subset_A(A, idx_list):
+    A_sub = A[idx_list]
+    A_sub = A_sub[:, idx_list]
+    return A_sub
+
+def get_PCA_object_value(A, r, idx):
+    A_sub = get_subset_A(A, list(idx))
+    U_PCA_sub, s_PCA_sub, Vh_PCA_sub = linalg.svd(A_sub)
+    max_r_idx = np.argsort(-s_PCA_sub)[:r]
+    # print("PCA object sub matrix eigenvalues: ", s_PCA_sub)
+
+    PCA_object_value = np.sum(s_PCA_sub[max_r_idx])
+    return -PCA_object_value
+
+
+if __name__ == "__main__":
+    # RowSparse_PCA_ADMM_MSDC(A, h, r, p)
+    pass
